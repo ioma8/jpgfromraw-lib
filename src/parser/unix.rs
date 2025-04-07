@@ -4,6 +4,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use tokio::fs::File;
 
+use super::EmbeddedJpegInfo;
+
 pub fn mmap_raw(file: File) -> Result<Mmap> {
     // SAFETY: mmap in general is unsafe because the lifecycle of the backing bytes are mutable
     // from outside the program.
@@ -29,7 +31,7 @@ pub async fn open_raw(path: &Path) -> Result<File> {
     Ok(File::open(path).await?)
 }
 
-pub fn prefetch_jpeg(raw_buf: &Mmap, jpeg: &crate::EmbeddedJpegInfo) -> Result<()> {
+pub fn prefetch_jpeg(raw_buf: &Mmap, jpeg: &EmbeddedJpegInfo) -> Result<()> {
     raw_buf.advise_range(Advice::WillNeed, jpeg.offset, jpeg.length)?;
     Ok(())
 }
