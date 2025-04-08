@@ -184,6 +184,16 @@ async fn write_jpeg(
     Ok(())
 }
 
+async fn get_jpeg_data(
+    jpeg_buf: &[u8],
+    jpeg_info: &EmbeddedJpegInfo,
+) -> Result<Vec<u8>> {
+    let mut jpeg_data = Vec::with_capacity(jpeg_buf.len() + 34);
+    jpeg_data.extend_from_slice(&get_header_bytes(jpeg_info.orientation.unwrap_or(1)));
+    jpeg_data.extend_from_slice(&jpeg_buf[2..]);
+    Ok(jpeg_data)
+}
+
 /// Process a single RAW file to extract the embedded JPEG, and then write the extracted JPEG to
 /// the output directory.
 pub async fn process_file(entry_path: &Path, out_dir: &Path, relative_path: &Path) -> Result<()> {
@@ -200,10 +210,11 @@ pub async fn process_file(entry_path: &Path, out_dir: &Path, relative_path: &Pat
 // Process a single RAW file to extract the embedded JPEG and return the JPEG bytes.
 pub async fn process_file_bytes(
     entry_path: &Path,
-) -> Result<(Vec<u8>, Option<u16>)> {
+) -> Result<(Vec<u8>)> {
     let in_file = platform::open_raw(entry_path).await?;
     let raw_buf = platform::mmap_raw(in_file)?;
     let jpeg_info = find_largest_embedded_jpeg(&raw_buf)?;
     let jpeg_buf = extract_jpeg(&raw_buf, &jpeg_info)?;
-    Ok((jpeg_buf.to_vec(), jpeg_info.orientation))
+    let jpeg_data = get_jpeg_data(jpeg_buf, &jpeg_info).await?;
+    Ok(jpeg_data)
 }
