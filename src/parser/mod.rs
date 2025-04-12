@@ -228,7 +228,7 @@ pub async fn process_file(entry_path: &Path, out_dir: &Path, relative_path: &Pat
 pub async fn process_file_bytes(
     entry_path: &Path,
     find_type: FindJpegType
-) -> Result<(Vec<u8>)> {
+) -> Result<Vec<u8>> {
     let in_file = platform::open_raw(entry_path).await?;
     let raw_buf = platform::mmap_raw(in_file)?;
     let jpeg_info = find_largest_embedded_jpeg(&raw_buf, find_type)?;
