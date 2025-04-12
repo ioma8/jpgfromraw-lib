@@ -26,6 +26,10 @@ pub struct EmbeddedJpegInfo {
     orientation: Option<u16>,
 }
 
+pub enum FindJpegType {
+    Largest,
+    Smallest,
+}
 /// Find the largest embedded JPEG data in a memory-mapped RAW buffer.
 ///
 /// This function parses the IFDs in the TIFF structure of the RAW file to find the largest JPEG
@@ -35,7 +39,7 @@ pub struct EmbeddedJpegInfo {
 ///
 /// - kamadak-exif: Reads into a big `Vec<u8>`, which is huge for our big RAW.
 /// - quickexif: Cannot iterate over IFDs.
-fn find_largest_embedded_jpeg(raw_buf: &[u8]) -> Result<EmbeddedJpegInfo> {
+fn find_largest_embedded_jpeg(raw_buf: &[u8], find_type: FindJpegType) -> Result<EmbeddedJpegInfo> {
     const IFD_ENTRY_SIZE: usize = 12;
     const TIFF_MAGIC_LE: &[u8] = b"II*\0";
     const TIFF_MAGIC_BE: &[u8] = b"MM\0*";
@@ -97,12 +101,25 @@ fn find_largest_embedded_jpeg(raw_buf: &[u8]) -> Result<EmbeddedJpegInfo> {
             }
 
             if let (Some(offset), Some(length)) = (cur_offset, cur_length) {
-                if length > largest_jpeg.length {
-                    largest_jpeg = EmbeddedJpegInfo {
-                        offset,
-                        length,
-                        orientation: cur_orientation,
-                    };
+                match find_type {
+                    FindJpegType::Smallest => {
+                        if length < largest_jpeg.length || largest_jpeg.length == 0 {
+                            largest_jpeg = EmbeddedJpegInfo {
+                                offset,
+                                length,
+                                orientation: cur_orientation,
+                            };
+                        }
+                    }
+                    FindJpegType::Largest => {
+                        if length > largest_jpeg.length {
+                            largest_jpeg = EmbeddedJpegInfo {
+                                offset,
+                                length,
+                                orientation: cur_orientation,
+                            };
+                        }
+                    }
                 }
                 break;
             }
@@ -196,10 +213,10 @@ async fn get_jpeg_data(
 
 /// Process a single RAW file to extract the embedded JPEG, and then write the extracted JPEG to
 /// the output directory.
-pub async fn process_file(entry_path: &Path, out_dir: &Path, relative_path: &Path) -> Result<()> {
+pub async fn process_file(entry_path: &Path, out_dir: &Path, relative_path: &Path, find_type: FindJpegType) -> Result<()> {
     let in_file = platform::open_raw(entry_path).await?;
     let raw_buf = platform::mmap_raw(in_file)?;
-    let jpeg_info = find_largest_embedded_jpeg(&raw_buf)?;
+    let jpeg_info = find_largest_embedded_jpeg(&raw_buf, find_type)?;
     let jpeg_buf = extract_jpeg(&raw_buf, &jpeg_info)?;
     let mut output_file = out_dir.join(relative_path);
     output_file.set_extension("jpg");
@@ -210,10 +227,11 @@ pub async fn process_file(entry_path: &Path, out_dir: &Path, relative_path: &Pat
 // Process a single RAW file to extract the embedded JPEG and return the JPEG bytes.
 pub async fn process_file_bytes(
     entry_path: &Path,
+    find_type: FindJpegType
 ) -> Result<(Vec<u8>)> {
     let in_file = platform::open_raw(entry_path).await?;
     let raw_buf = platform::mmap_raw(in_file)?;
-    let jpeg_info = find_largest_embedded_jpeg(&raw_buf)?;
+    let jpeg_info = find_largest_embedded_jpeg(&raw_buf, find_type)?;
     let jpeg_buf = extract_jpeg(&raw_buf, &jpeg_info)?;
     let jpeg_data = get_jpeg_data(jpeg_buf, &jpeg_info).await?;
     Ok(jpeg_data)

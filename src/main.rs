@@ -101,7 +101,7 @@ async fn process_directory(
         let progress_bar = progress_bar.clone();
         let task: tokio::task::JoinHandle<Result<ProcessingResult>> = tokio::spawn(async move {
             let permit = semaphore.acquire_owned().await?;
-            let result = process_file(&in_path, out_dir, &relative_path).await;
+            let result = process_file(&in_path, out_dir, &relative_path, jpgfromraw::FindJpegType::Largest).await;
             drop(permit);
             progress_bar.inc(1);
             Ok(ProcessingResult {
