@@ -1,10 +1,7 @@
 use anyhow::{ensure, Result};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use memmap2::Mmap;
-use std::io::IoSlice;
 use std::path::Path;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
 
 #[cfg(unix)]
 mod unix;
@@ -30,6 +27,31 @@ pub enum FindJpegType {
     Largest,
     Smallest,
 }
+
+fn find_tiff_header_offset(raw_buf: &[u8]) -> Result<usize> {
+    let mut i = 0;
+    while i + 10 < raw_buf.len() {
+        if raw_buf[i] == 0xFF && raw_buf[i + 1] == 0xE1 {
+            let segment_len = u16::from_be_bytes([raw_buf[i + 2], raw_buf[i + 3]]) as usize;
+            if raw_buf[i + 4..i + 10] == *b"Exif\0\0" {
+                {
+                    let bytes = &raw_buf[i + 10..i+20];
+                    print!("Hex: ");
+                    for byte in bytes {
+                        print!("{:02X} ", byte);
+                    }
+                    println!();
+                }
+                return Ok(i + 10); // TIFF header starts right after "Exif\0\0"
+            } else {
+                i += 2 + segment_len;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Err(anyhow::anyhow!("No Exif APP1 segment with TIFF header found"))
+}
 /// Find the largest embedded JPEG data in a memory-mapped RAW buffer.
 ///
 /// This function parses the IFDs in the TIFF structure of the RAW file to find the largest JPEG
@@ -39,13 +61,15 @@ pub enum FindJpegType {
 ///
 /// - kamadak-exif: Reads into a big `Vec<u8>`, which is huge for our big RAW.
 /// - quickexif: Cannot iterate over IFDs.
-fn find_largest_embedded_jpeg(raw_buf: &[u8], find_type: FindJpegType) -> Result<EmbeddedJpegInfo> {
+fn find_largest_embedded_jpeg(raw_buf: &[u8], tiff_offset: usize, find_type: FindJpegType) -> Result<EmbeddedJpegInfo> {
     const IFD_ENTRY_SIZE: usize = 12;
     const TIFF_MAGIC_LE: &[u8] = b"II*\0";
     const TIFF_MAGIC_BE: &[u8] = b"MM\0*";
     const JPEG_TAG: u16 = 0x201;
     const JPEG_LENGTH_TAG: u16 = 0x202;
     const ORIENTATION_TAG: u16 = 0x112;
+
+    let raw_buf = &raw_buf[tiff_offset..];
 
     ensure!(raw_buf.len() >= 8, "Not enough data for TIFF header");
 
@@ -142,7 +166,9 @@ fn find_largest_embedded_jpeg(raw_buf: &[u8], find_type: FindJpegType) -> Result
         "JPEG data exceeds file size"
     );
 
-    Ok(largest_jpeg)
+    let jpeg_offset = largest_jpeg.offset + tiff_offset;
+
+    Ok(EmbeddedJpegInfo { offset: jpeg_offset, length: largest_jpeg.length, orientation: largest_jpeg.orientation })
 }
 
 /// Extract the JPEG bytes from the memory-mapped RAW buffer.
@@ -172,35 +198,6 @@ const fn get_header_bytes(orientation: u16) -> [u8; 34] {
     ]
 }
 
-async fn write_jpeg(
-    output_file: &Path,
-    jpeg_buf: &[u8],
-    jpeg_info: &EmbeddedJpegInfo,
-) -> Result<()> {
-    let mut out_file = File::create(output_file).await?;
-    let hdr_bytes = get_header_bytes(jpeg_info.orientation.unwrap_or(1)); // 1 is default
-    let mut header = hdr_bytes.as_ref();
-    let mut body = &jpeg_buf[2..];
-
-    while header.len() + body.len() > 0 {
-        let slices = [IoSlice::new(header), IoSlice::new(body)];
-        let n = out_file.write_vectored(&slices).await?;
-        ensure!(n > 0, "Vectored write failed");
-
-        if n < header.len() {
-            // We didn't get past the header yet, remove bytes from it
-            header = &header[n..];
-        } else {
-            // We are past the header and are in the body, remove bytes from the body
-            let n = n - header.len();
-            header = &[];
-            body = &body[n..];
-        }
-    }
-
-    Ok(())
-}
-
 async fn get_jpeg_data(
     jpeg_buf: &[u8],
     jpeg_info: &EmbeddedJpegInfo,
@@ -214,13 +211,13 @@ async fn get_jpeg_data(
 /// Process a single RAW file to extract the embedded JPEG, and then write the extracted JPEG to
 /// the output directory.
 pub async fn process_file(entry_path: &Path, out_dir: &Path, relative_path: &Path, find_type: FindJpegType) -> Result<()> {
-    let in_file = platform::open_raw(entry_path).await?;
-    let raw_buf = platform::mmap_raw(in_file)?;
-    let jpeg_info = find_largest_embedded_jpeg(&raw_buf, find_type)?;
-    let jpeg_buf = extract_jpeg(&raw_buf, &jpeg_info)?;
+    let jpeg_data = process_file_bytes(entry_path, find_type).await?;
     let mut output_file = out_dir.join(relative_path);
     output_file.set_extension("jpg");
-    write_jpeg(&output_file, jpeg_buf, &jpeg_info).await?;
+    if let Some(parent) = output_file.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&output_file, &jpeg_data).await?;
     Ok(())
 }
 
@@ -231,7 +228,12 @@ pub async fn process_file_bytes(
 ) -> Result<Vec<u8>> {
     let in_file = platform::open_raw(entry_path).await?;
     let raw_buf = platform::mmap_raw(in_file)?;
-    let jpeg_info = find_largest_embedded_jpeg(&raw_buf, find_type)?;
+    let tiff_offset = if let Ok(offset) = find_tiff_header_offset(&raw_buf) {
+        offset
+    } else {
+        0
+    };
+    let jpeg_info = find_largest_embedded_jpeg(&raw_buf, tiff_offset, find_type)?;
     let jpeg_buf = extract_jpeg(&raw_buf, &jpeg_info)?;
     let jpeg_data = get_jpeg_data(jpeg_buf, &jpeg_info).await?;
     Ok(jpeg_data)
