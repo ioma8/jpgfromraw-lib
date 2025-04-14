@@ -7,6 +7,8 @@ use windows::Win32::Storage::FileSystem::FILE_FLAG_RANDOM_ACCESS;
 use windows::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
 use windows::Win32::System::Threading::GetCurrentProcess;
 
+use super::EmbeddedJpegInfo;
+
 pub fn mmap_raw(file: File) -> Result<Mmap> {
     // SAFETY: see comment in unix.rs
     let raw_buf = unsafe { Mmap::map(file.as_raw_handle())? };
@@ -23,7 +25,7 @@ pub async fn open_raw(path: &Path) -> Result<File> {
         .await?)
 }
 
-pub fn prefetch_jpeg(raw_buf: &Mmap, jpeg: &crate::EmbeddedJpegInfo) -> Result<()> {
+pub fn prefetch_jpeg(raw_buf: &Mmap, jpeg: &EmbeddedJpegInfo) -> Result<()> {
     ensure!(
         jpeg.offset + jpeg.length <= raw_buf.len(),
         "JPEG data is out of bounds"

@@ -1,5 +1,6 @@
 use anyhow::{ensure, Result};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use core::slice;
 use memchr::memmem;
 use memmap2::Mmap;
 use std::path::Path;
@@ -31,6 +32,7 @@ pub enum FindJpegType {
 }
 
 const TIFF_HEADER: &[u8; 4] = b"II*\0";
+const TIFF_HEADERMM: &[u8; 4] = b"MM\0*";
 const EXIF_HEADER: &[u8; 6] = b"Exif\0\0";
 const EXIF_HEADER_SIZE: usize = 6;
 
@@ -41,7 +43,25 @@ fn find_tiff_header_offset(raw_buf: &[u8]) -> Result<usize> {
 
     let found = memmem::find_iter(raw_buf, EXIF_HEADER).next();
     if let Some(pos) = found {
-        return Ok(pos + EXIF_HEADER_SIZE);
+        if pos < 10 {
+            return Err(anyhow::anyhow!("Invalid Exif header position: {}", pos));
+        }
+        let slice_start = pos + EXIF_HEADER_SIZE;
+        ensure!(slice_start < raw_buf.len(), "Invalid Exif header position");
+        let slice_end = slice_start + 10;
+        ensure!(slice_end <= raw_buf.len(), "Invalid Exif header position");
+        let slice = &raw_buf[slice_start..slice_end];
+        let tiff_found = memmem::find_iter(&slice, TIFF_HEADER).next();
+        if let Some(tiff_pos) = tiff_found {
+            println!("Found TIFF header at: {}", tiff_pos);
+            return Ok(slice_start + tiff_pos);
+        }
+        let tiff_found = memmem::find_iter(&slice, TIFF_HEADERMM).next();
+        if let Some(tiff_pos) = tiff_found {
+            println!("Found TIFF header2 at: {}", tiff_pos);
+            return Ok(slice_start + tiff_pos);
+        }
+        return Ok(slice_start);
     }
     Err(anyhow::anyhow!(
         "No Exif APP1 segment with TIFF header found"
@@ -228,6 +248,7 @@ pub async fn process_file(
 
 // Process a single RAW file to extract the embedded JPEG and return the JPEG bytes.
 pub async fn process_file_bytes(entry_path: &Path, find_type: FindJpegType) -> Result<Vec<u8>> {
+    println!("Processing file: {}", entry_path.display());
     let start = Instant::now();
     let in_file = platform::open_raw(entry_path).await?;
     println!("Time to open_raw: {:?}", start.elapsed());
@@ -237,25 +258,53 @@ pub async fn process_file_bytes(entry_path: &Path, find_type: FindJpegType) -> R
     println!("Time to mmap_raw: {:?}", start.elapsed());
 
     let start = Instant::now();
-    let tiff_offset = if let Ok(offset) = find_tiff_header_offset(&raw_buf) {
-        offset
-    } else {
-        0
-    };
+    let tiff_offset_result = find_tiff_header_offset(&raw_buf);
+
+    //    Format	Hex Signature (First Bytes)	ASCII (if readable)	Offset	Notes
+    //JPEG	FF D8 FF	—	0x00	Followed by E0, E1, etc. (APPx markers)
+    //PNG	89 50 4E 47 0D 0A 1A 0A	.PNG....	0x00	8 bytes long, very specific
+    //GIF	47 49 46 38 37 61 or 47 49 46 38 39 61	GIF87a or GIF89a	0x00	Indicates version
+    //TIFF (little-endian)	49 49 2A 00	II*.	0x00	"Intel" byte order
+    //TIFF (big-endian)	4D 4D 00 2A	MM.*	0x00	"Motorola" byte order
+    /*
+         How to Detect BMP and WebP
+    BMP: Always starts with 42 4D (ASCII "BM") — stands for "Bitmap".
+
+    WebP:
+
+    Is stored inside a RIFF container (like WAV/AVI).
+
+    First 4 bytes: 52 49 46 46 (ASCII "RIFF")
+
+    At offset 8: 57 45 42 50 (ASCII "WEBP")
+     */
+
+    if let Err(_) = tiff_offset_result {
+        return Ok(raw_buf.to_vec());
+    }
+
+    let tiff_offset = tiff_offset_result.unwrap();
+
     println!("Offset found at: {}", tiff_offset);
     println!("Time to find_tiff_header_offset: {:?}", start.elapsed());
 
     let start = Instant::now();
-    let jpeg_info = find_largest_embedded_jpeg(&raw_buf, tiff_offset, find_type)?;
+    let jpeg_info = find_largest_embedded_jpeg(&raw_buf, tiff_offset, find_type);
     println!("Time to find_largest_embedded_jpeg: {:?}", start.elapsed());
 
-    let start = Instant::now();
-    let jpeg_buf = extract_jpeg(&raw_buf, &jpeg_info)?;
-    println!("Time to extract_jpeg: {:?}", start.elapsed());
+    let jpeg_data = if let Ok(jpeg_info) = jpeg_info {
+        let start = Instant::now();
 
-    let start = Instant::now();
-    let jpeg_data = get_jpeg_data(jpeg_buf, &jpeg_info).await?;
-    println!("Time to get_jpeg_data: {:?}", start.elapsed());
+        let jpeg_buf = extract_jpeg(&raw_buf, &jpeg_info)?;
+        println!("Time to extract_jpeg: {:?}", start.elapsed());
+
+        let start = Instant::now();
+        let jpeg_data = get_jpeg_data(jpeg_buf, &jpeg_info).await?;
+        println!("Time to get_jpeg_data: {:?}", start.elapsed());
+        jpeg_data
+    } else {
+        raw_buf.to_vec()
+    };
 
     Ok(jpeg_data)
 }
