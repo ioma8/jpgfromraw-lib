@@ -1,5 +1,6 @@
 use anyhow::{ensure, Result};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use memchr::memmem;
 use memmap2::Mmap;
 use std::path::Path;
 
@@ -12,6 +13,7 @@ mod windows;
 #[cfg(unix)]
 use unix as platform;
 
+use std::time::Instant;
 #[cfg(windows)]
 use windows as platform;
 
@@ -28,29 +30,23 @@ pub enum FindJpegType {
     Smallest,
 }
 
+const TIFF_HEADER: &[u8; 4] = b"II*\0";
+const EXIF_HEADER: &[u8; 6] = b"Exif\0\0";
+const EXIF_HEADER_SIZE: usize = 6;
+
 fn find_tiff_header_offset(raw_buf: &[u8]) -> Result<usize> {
-    let mut i = 0;
-    while i + 10 < raw_buf.len() {
-        if raw_buf[i] == 0xFF && raw_buf[i + 1] == 0xE1 {
-            let segment_len = u16::from_be_bytes([raw_buf[i + 2], raw_buf[i + 3]]) as usize;
-            if raw_buf[i + 4..i + 10] == *b"Exif\0\0" {
-                {
-                    let bytes = &raw_buf[i + 10..i+20];
-                    print!("Hex: ");
-                    for byte in bytes {
-                        print!("{:02X} ", byte);
-                    }
-                    println!();
-                }
-                return Ok(i + 10); // TIFF header starts right after "Exif\0\0"
-            } else {
-                i += 2 + segment_len;
-            }
-        } else {
-            i += 1;
-        }
+    let found = memmem::find_iter(raw_buf, TIFF_HEADER).next();
+    if let Some(0) = found {
+        return Ok(0);
     }
-    Err(anyhow::anyhow!("No Exif APP1 segment with TIFF header found"))
+
+    let found = memmem::find_iter(raw_buf, EXIF_HEADER).next();
+    if let Some(pos) = found {
+        return Ok(pos + EXIF_HEADER_SIZE);
+    }
+    Err(anyhow::anyhow!(
+        "No Exif APP1 segment with TIFF header found"
+    ))
 }
 /// Find the largest embedded JPEG data in a memory-mapped RAW buffer.
 ///
@@ -61,7 +57,11 @@ fn find_tiff_header_offset(raw_buf: &[u8]) -> Result<usize> {
 ///
 /// - kamadak-exif: Reads into a big `Vec<u8>`, which is huge for our big RAW.
 /// - quickexif: Cannot iterate over IFDs.
-fn find_largest_embedded_jpeg(raw_buf: &[u8], tiff_offset: usize, find_type: FindJpegType) -> Result<EmbeddedJpegInfo> {
+fn find_largest_embedded_jpeg(
+    raw_buf: &[u8],
+    tiff_offset: usize,
+    find_type: FindJpegType,
+) -> Result<EmbeddedJpegInfo> {
     const IFD_ENTRY_SIZE: usize = 12;
     const TIFF_MAGIC_LE: &[u8] = b"II*\0";
     const TIFF_MAGIC_BE: &[u8] = b"MM\0*";
@@ -168,7 +168,11 @@ fn find_largest_embedded_jpeg(raw_buf: &[u8], tiff_offset: usize, find_type: Fin
 
     let jpeg_offset = largest_jpeg.offset + tiff_offset;
 
-    Ok(EmbeddedJpegInfo { offset: jpeg_offset, length: largest_jpeg.length, orientation: largest_jpeg.orientation })
+    Ok(EmbeddedJpegInfo {
+        offset: jpeg_offset,
+        length: largest_jpeg.length,
+        orientation: largest_jpeg.orientation,
+    })
 }
 
 /// Extract the JPEG bytes from the memory-mapped RAW buffer.
@@ -198,10 +202,7 @@ const fn get_header_bytes(orientation: u16) -> [u8; 34] {
     ]
 }
 
-async fn get_jpeg_data(
-    jpeg_buf: &[u8],
-    jpeg_info: &EmbeddedJpegInfo,
-) -> Result<Vec<u8>> {
+async fn get_jpeg_data(jpeg_buf: &[u8], jpeg_info: &EmbeddedJpegInfo) -> Result<Vec<u8>> {
     let mut jpeg_data = Vec::with_capacity(jpeg_buf.len() + 34);
     jpeg_data.extend_from_slice(&get_header_bytes(jpeg_info.orientation.unwrap_or(1)));
     jpeg_data.extend_from_slice(&jpeg_buf[2..]);
@@ -210,7 +211,12 @@ async fn get_jpeg_data(
 
 /// Process a single RAW file to extract the embedded JPEG, and then write the extracted JPEG to
 /// the output directory.
-pub async fn process_file(entry_path: &Path, out_dir: &Path, relative_path: &Path, find_type: FindJpegType) -> Result<()> {
+pub async fn process_file(
+    entry_path: &Path,
+    out_dir: &Path,
+    relative_path: &Path,
+    find_type: FindJpegType,
+) -> Result<()> {
     let jpeg_data = process_file_bytes(entry_path, find_type).await?;
     let mut output_file = out_dir.join(relative_path);
     output_file.set_extension("jpg");
@@ -222,19 +228,35 @@ pub async fn process_file(entry_path: &Path, out_dir: &Path, relative_path: &Pat
 }
 
 // Process a single RAW file to extract the embedded JPEG and return the JPEG bytes.
-pub async fn process_file_bytes(
-    entry_path: &Path,
-    find_type: FindJpegType
-) -> Result<Vec<u8>> {
+pub async fn process_file_bytes(entry_path: &Path, find_type: FindJpegType) -> Result<Vec<u8>> {
+    let start = Instant::now();
     let in_file = platform::open_raw(entry_path).await?;
+    println!("Time to open_raw: {:?}", start.elapsed());
+
+    let start = Instant::now();
     let raw_buf = platform::mmap_raw(in_file)?;
+    println!("Time to mmap_raw: {:?}", start.elapsed());
+
+    let start = Instant::now();
     let tiff_offset = if let Ok(offset) = find_tiff_header_offset(&raw_buf) {
         offset
     } else {
         0
     };
+    println!("Offset found at: {}", tiff_offset);
+    println!("Time to find_tiff_header_offset: {:?}", start.elapsed());
+
+    let start = Instant::now();
     let jpeg_info = find_largest_embedded_jpeg(&raw_buf, tiff_offset, find_type)?;
+    println!("Time to find_largest_embedded_jpeg: {:?}", start.elapsed());
+
+    let start = Instant::now();
     let jpeg_buf = extract_jpeg(&raw_buf, &jpeg_info)?;
+    println!("Time to extract_jpeg: {:?}", start.elapsed());
+
+    let start = Instant::now();
     let jpeg_data = get_jpeg_data(jpeg_buf, &jpeg_info).await?;
+    println!("Time to get_jpeg_data: {:?}", start.elapsed());
+
     Ok(jpeg_data)
 }
