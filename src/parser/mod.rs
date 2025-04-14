@@ -35,8 +35,7 @@ const EXIF_HEADER: &[u8; 6] = b"Exif\0\0";
 const EXIF_HEADER_SIZE: usize = 6;
 
 fn find_tiff_header_offset(raw_buf: &[u8]) -> Result<usize> {
-    let found = memmem::find_iter(raw_buf, TIFF_HEADER).next();
-    if let Some(0) = found {
+    if &raw_buf[0..4] == TIFF_HEADER {
         return Ok(0);
     }
 
