@@ -1,6 +1,5 @@
 use anyhow::{ensure, Result};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use core::slice;
 use memchr::memmem;
 use memmap2::Mmap;
 use std::path::Path;
